@@ -5,7 +5,8 @@ import inspect
 import threading
 import warnings
 from argparse import Namespace
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from itertools import product
 from types import SimpleNamespace
 from typing import Any, ClassVar, TypeVar
 
@@ -15,6 +16,8 @@ from pydantic._internal._signature import _field_name_for_signature
 from pydantic._internal._utils import deep_update, is_model_class
 from pydantic.dataclasses import is_pydantic_dataclass
 from pydantic.main import BaseModel
+
+from pydantic_settings.sources.utils import _get_alias_names
 
 from .exceptions import SettingsError
 from .sources import (
@@ -424,24 +427,77 @@ class BaseSettings(BaseModel):
 
         self._settings_warn_unused_config_keys(sources, self.model_config)
 
-        if sources:
-            state: dict[str, Any] = {}
-            states: dict[str, dict[str, Any]] = {}
-            for source in sources:
-                if isinstance(source, PydanticBaseSettingsSource):
-                    source._set_current_state(state)
-                    source._set_settings_sources_data(states)
-
-                source_name = source.__name__ if hasattr(source, '__name__') else type(source).__name__
-                source_state = source()
-
-                states[source_name] = source_state
-                state = deep_update(source_state, state)
-            return state
-        else:
-            # no one should mean to do this, but I think returning an empty dict is marginally preferable
-            # to an informative error and much better than a confusing error
+        if not sources:
             return {}
+
+        # Evaluate the state of each settings source like this:
+        #   > states = {getattr(source, "__name__", type(source).__name__): source() for source in sources}
+        # To support the feature where custom settings sources (AFAIK, no standard SettingsSource actually uses the
+        # `current_state` or `settings_sources_data`) have access to higher priority field values we need to set the
+        # state and stick with the slightly more complex solution.
+        states = self._update_source_states(sources)
+
+        # Given the preloaded state of all sources
+        init_kwargs, resolved_fields = self._resolve_fields(states)
+
+        # Let's now determine which aliases should be considered resolved to include also the extra kwargs explicitly
+        resolved_aliases = self._determine_resolved_aliases(resolved_fields)
+
+        # Reversely iterate through states and add all kwargs that were not previously resolved through field aliases.
+        extra_init_kwargs = {k: v for s in reversed(states.values()) for k, v in s.items() if k not in resolved_aliases}
+        return deep_update(extra_init_kwargs, init_kwargs)
+
+    def _update_source_states(self, sources: Sequence[PydanticBaseSettingsSource]) -> dict[str, dict[str, Any]]:
+        state: dict[str, Any] = {}
+        states: dict[str, dict[str, Any]] = {}
+        for source in sources:
+            if isinstance(source, PydanticBaseSettingsSource):
+                source._set_current_state(state)
+                source._set_settings_sources_data(states)
+
+            source_state = source()
+
+            states[getattr(source, '__name__', type(source).__name__)] = source_state
+            state = deep_update(source_state, state)
+        return states
+
+    def _resolve_fields(self, states: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], set[str]]:
+        init_kwargs: dict[str, Any] = {}
+        resolved_fields = set()
+        for field_name, field_info in self.__class__.model_fields.items():
+            field_aliases, *_ = _get_alias_names(field_name, field_info)
+            for state, alias in product(states.values(), field_aliases):
+                # If a field is resolved already, we can jump to the next field
+                if field_name in resolved_fields:
+                    break
+                # If the current alias is not found in the current state, let's skip to the next combination
+                if alias not in state:
+                    continue
+                # Unpack the value of the current alias from the current field
+                value = state[alias]
+
+                # If the values is None, we probably don't want to assign it (please do confirm)
+                if value is None:
+                    continue
+
+                if isinstance(value, Mapping):
+                    # For mappings, we need to allow updates of lower priority sources, but always ensure the previous
+                    # values take precedence
+                    init_kwargs[alias] = deep_update(state[alias], init_kwargs.get(alias, {}))
+                else:
+                    # We can set this field to resolved, as it may not accept updates from lower priority sources
+                    init_kwargs[alias] = state[alias]
+                    resolved_fields.add(field_name)
+
+        return init_kwargs, resolved_fields
+
+    def _determine_resolved_aliases(self, resolved_fields: set[str]) -> set[str]:
+        resolved_aliases = set()
+        for field_name, field_info in self.__class__.model_fields.items():
+            if field_name in resolved_fields:
+                field_aliases, *_ = _get_alias_names(field_name, field_info)
+                resolved_aliases |= set(field_aliases)
+        return resolved_aliases
 
     @staticmethod
     def _settings_warn_unused_config_keys(sources: tuple[object, ...], model_config: SettingsConfigDict) -> None:

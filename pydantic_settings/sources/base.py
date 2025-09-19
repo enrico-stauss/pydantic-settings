@@ -268,6 +268,8 @@ class InitSettingsSource(PydanticBaseSettingsSource):
             init_kwarg_name = init_kwarg_names & set(alias_names)
             if init_kwarg_name:
                 preferred_alias = next((alias for alias in alias_names if alias in init_kwarg_name), None)
+                if preferred_alias is None:
+                    continue
                 init_kwarg_names -= init_kwarg_name
                 self.init_kwargs[preferred_alias] = init_kwargs[preferred_alias]
         self.init_kwargs.update({key: val for key, val in init_kwargs.items() if key in init_kwarg_names})
